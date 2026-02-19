@@ -1,6 +1,6 @@
 //! macOS CGEventTap — intercepts and suppresses key events.
-//! Modifier keys (Cmd, Opt) arrive via FlagsChanged, NOT KeyDown/KeyUp.
-//! Autorepeat KeyDown events are filtered to prevent double-firing.
+//! Modifier keys arrive via FlagsChanged, NOT KeyDown/KeyUp.
+//! Injected Cmd+C/X events are identified and passed through cleanly.
 
 use crate::hotkey::{ChordDetector, HotkeyAction};
 use core_foundation::base::TCFType;
@@ -14,7 +14,11 @@ use std::sync::mpsc::SyncSender;
 use tracing::{debug, info};
 
 pub fn start_event_tap(tx: SyncSender<HotkeyAction>, mode_static: bool) {
-    let detector = RefCell::new(ChordDetector::new());
+    let detector     = RefCell::new(ChordDetector::new());
+    // One-shot flag: ignore the next KeyC or KeyX that arrives
+    // after we inject simulate_copy / simulate_cut
+    let ignore_next_c = RefCell::new(false);
+    let ignore_next_x = RefCell::new(false);
 
     let tap = CGEventTap::new(
         CGEventTapLocation::HID,
@@ -28,6 +32,8 @@ pub fn start_event_tap(tx: SyncSender<HotkeyAction>, mode_static: bool) {
         move |_proxy, event_type, event| {
             handle_event(
                 &mut detector.borrow_mut(),
+                &mut ignore_next_c.borrow_mut(),
+                &mut ignore_next_x.borrow_mut(),
                 &tx,
                 event_type,
                 event,
@@ -51,11 +57,13 @@ pub fn start_event_tap(tx: SyncSender<HotkeyAction>, mode_static: bool) {
 }
 
 fn handle_event(
-    detector:   &mut ChordDetector,
-    tx:         &SyncSender<HotkeyAction>,
-    event_type: CGEventType,
-    event:      &CGEvent,
-    mode_static: bool,
+    detector:      &mut ChordDetector,
+    ignore_next_c: &mut bool,
+    ignore_next_x: &mut bool,
+    tx:            &SyncSender<HotkeyAction>,
+    event_type:    CGEventType,
+    event:         &CGEvent,
+    mode_static:   bool,
 ) -> Option<CGEvent> {
     let flags = event.get_flags();
     let cmd   = flags.contains(CGEventFlags::CGEventFlagCommand);
@@ -63,19 +71,15 @@ fn handle_event(
 
     match event_type {
 
-        // ── FlagsChanged: Cmd / Opt / Shift press or release ──────────
-        // This is the ONLY way modifiers arrive — never as KeyDown/KeyUp.
+        // ── FlagsChanged ──────────────────────────────────────────────
         CGEventType::FlagsChanged => {
             sync_modifiers(detector, flags);
             debug!("Modifiers → cmd={} opt={}", cmd, opt);
-            Some(event.to_owned()) // never suppress modifier-only events
+            Some(event.to_owned())
         }
 
         // ── KeyDown ───────────────────────────────────────────────────
         CGEventType::KeyDown => {
-            // macOS sends repeated KeyDown while a key is held down.
-            // KEYBOARD_EVENT_AUTOREPEAT == 1 means it is a repeat.
-            // Suppress silently — do not fire another action.
             let is_repeat = event
                 .get_integer_value_field(EventField::KEYBOARD_EVENT_AUTOREPEAT)
                 == 1;
@@ -93,24 +97,46 @@ fn handle_event(
                 None    => return Some(event.to_owned()),
             };
 
+            // ── Injection guard ───────────────────────────────────────
+            // If we injected Cmd+C or Cmd+X, the next KeyC / KeyX that
+            // arrives is our own injection — let it pass through and
+            // clear the flag so normal copies work afterward.
+            if key == rdev::Key::KeyC && *ignore_next_c {
+                *ignore_next_c = false;
+                debug!("Passing injected Cmd+C through");
+                return Some(event.to_owned()); // pass to target app
+            }
+            if key == rdev::Key::KeyX && *ignore_next_x {
+                *ignore_next_x = false;
+                debug!("Passing injected Cmd+X through");
+                return Some(event.to_owned());
+            }
+
             detector.key_down(key.clone());
             debug!("KeyDown {:?}  cmd={} opt={}", key, cmd, opt);
 
             if cmd && opt {
-                // Tab and Esc fire on press
+                // Set ignore flag BEFORE firing DynamicCopy/Cut
+                // so when simulate_copy/simulate_cut fires Cmd+C/X
+                // we pass it straight through
+                if key == rdev::Key::KeyC {
+                    *ignore_next_c = true;
+                }
+                if key == rdev::Key::KeyX {
+                    *ignore_next_x = true;
+                }
+
                 if let Some(action) = detector.evaluate_press(&key, mode_static) {
                     debug!("Action (press): {:?}", action);
                     let _ = tx.send(action);
                 }
-                return None; // suppress — Cmd+C etc never reach OS
+                return None;
             }
 
             Some(event.to_owned())
         }
 
         // ── KeyUp ─────────────────────────────────────────────────────
-        // C / V / X fire here — intent confirmed when finger lifts
-        // while Cmd+Opt is still held.
         CGEventType::KeyUp => {
             let keycode = event
                 .get_integer_value_field(EventField::KEYBOARD_EVENT_KEYCODE)
@@ -121,7 +147,6 @@ fn handle_event(
                 None    => return Some(event.to_owned()),
             };
 
-            // Check cmd/opt BEFORE updating held set
             let was_clipwallet = cmd && opt;
 
             if was_clipwallet {
@@ -134,7 +159,7 @@ fn handle_event(
             detector.key_up(key);
 
             if was_clipwallet {
-                return None; // suppress the key-up too
+                return None;
             }
 
             Some(event.to_owned())
@@ -144,8 +169,6 @@ fn handle_event(
     }
 }
 
-/// Mirror exact modifier state from CGEventFlags into the detector.
-/// Called on every FlagsChanged event.
 fn sync_modifiers(detector: &mut ChordDetector, flags: CGEventFlags) {
     use rdev::Key;
 
@@ -171,7 +194,6 @@ fn sync_modifiers(detector: &mut ChordDetector, flags: CGEventFlags) {
     }
 }
 
-/// Map CGKeyCode (macOS hardware codes) → rdev::Key
 fn keycode_to_rdev(code: u16) -> Option<rdev::Key> {
     use rdev::Key::*;
     Some(match code {
