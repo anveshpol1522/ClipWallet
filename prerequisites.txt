@@ -1,0 +1,14 @@
+# Check Rust
+rustc --version
+cargo --version
+
+# If not installed, run:
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+source "$HOME/.cargo/env"
+
+# Verify Xcode CLI tools (required for macOS linking)
+xcode-select --version
+
+# If not installed:
+xcode-select --install
+
