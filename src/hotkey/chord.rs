@@ -3,7 +3,7 @@ use std::collections::HashSet;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum HotkeyAction {
-    // Static mode
+    // Static mode — fixed addressed slots 1-9
     StaticCopy(usize),
     StaticPaste(usize),
     StaticCut(usize),
@@ -11,10 +11,10 @@ pub enum HotkeyAction {
     StaticNavigatePrev,
     StaticDeleteCurrent,
 
-    // Dynamic mode
+    // Dynamic mode — recency ring
     DynamicCopy,
     DynamicCut,
-    DynamicPaste,           // Cmd+Opt+V in dynamic mode — pastes cursor entry
+    DynamicPaste,
     DynamicNavigateNext,
     DynamicNavigatePrev,
     DynamicDeleteCurrent,
@@ -25,30 +25,58 @@ pub enum HotkeyAction {
 
 pub struct ChordDetector {
     held:         HashSet<Key>,
-    /// Prevents Tab from firing repeatedly while held down
     tab_consumed: bool,
+
+    /// The digit pressed while Cmd+Opt was active.
+    /// Survives the digit key being released so C/V/X can read it.
+    /// Cleared only when Cmd or Opt is released (chord broken).
+    last_digit: Option<usize>,
+
+    /// Set to true when a key (C/V/X) is pressed while Cmd+Opt active.
+    /// Used at release time so we don't miss actions if Opt is released
+    /// slightly before the letter key.
+    keys_pressed_in_chord: HashSet<Key>,
 }
 
 impl ChordDetector {
     pub fn new() -> Self {
         Self {
-            held:         HashSet::new(),
-            tab_consumed: false,
+            held:                  HashSet::new(),
+            tab_consumed:          false,
+            last_digit:            None,
+            keys_pressed_in_chord: HashSet::new(),
         }
     }
 
     pub fn key_down(&mut self, key: Key) {
+        // If Cmd+Opt active when this key goes down, remember it
+        if self.cmd() && self.opt() {
+            if let Some(d) = key_to_digit(&key) {
+                self.last_digit = Some(d);
+            }
+            // Track that this key was pressed inside the chord
+            self.keys_pressed_in_chord.insert(key.clone());
+        }
         self.held.insert(key);
     }
 
     pub fn key_up(&mut self, key: Key) {
         if key == Key::Tab {
-            self.tab_consumed = false; // reset so next press fires again
+            self.tab_consumed = false;
         }
+
+        // Chord broken when Cmd or Opt released — clear chord state
+        if key == Key::MetaLeft || key == Key::MetaRight
+            || key == Key::Alt   || key == Key::AltGr
+        {
+            self.last_digit = None;
+            self.keys_pressed_in_chord.clear();
+        }
+
         self.held.remove(&key);
     }
 
-    // ── Modifier helpers ──────────────────────────────────────────────
+    // ── Modifier state ────────────────────────────────────────────────
 
     pub fn cmd(&self) -> bool {
         self.held.contains(&Key::MetaLeft)
@@ -65,9 +93,8 @@ impl ChordDetector {
             || self.held.contains(&Key::ShiftRight)
     }
 
-    // ── Called on KeyPress ────────────────────────────────────────────
-    // Only Tab fires on press — one action per physical press.
-    // C / V / X are handled in evaluate_release.
+    // ── Press-triggered: Tab / Esc ────────────────────────────────────
+
     pub fn evaluate_press(
         &mut self,
         key: &Key,
@@ -79,9 +106,7 @@ impl ChordDetector {
 
         match key {
             Key::Tab => {
-                if self.tab_consumed {
-                    return None; // ignore held-down repeats
-                }
+                if self.tab_consumed { return None; }
                 self.tab_consumed = true;
 
                 if self.held.contains(&Key::Escape) {
@@ -119,43 +144,46 @@ impl ChordDetector {
         }
     }
 
-    // ── Called on KeyRelease ──────────────────────────────────────────
-    // C / V / X fire here — user must fully press AND release the key
-    // while Cmd+Opt is still held.
+    // ── Release-triggered: C / V / X ─────────────────────────────────
+    // Fires when the key is released IF it was pressed while chord was active.
+    // Does NOT require Cmd+Opt to still be held at release time —
+    // this handles the common case where a modifier is released
+    // a few ms before the letter key.
+
     pub fn evaluate_release(
-        &self,
+        &mut self,
         key: &Key,
         mode_static: bool,
     ) -> Option<HotkeyAction> {
-        if !self.cmd() || !self.opt() {
+        // The key must have been pressed inside the chord
+        if !self.keys_pressed_in_chord.contains(key) {
             return None;
         }
 
+        // Consume so it can't fire twice
+        self.keys_pressed_in_chord.remove(key);
+
         match key {
-            // ── Copy ──────────────────────────────────────────────────
             Key::KeyC => {
                 if mode_static {
-                    self.digit_held().map(HotkeyAction::StaticCopy)
+                    // Slot required — no digit means no-op
+                    self.last_digit.map(HotkeyAction::StaticCopy)
                 } else {
                     Some(HotkeyAction::DynamicCopy)
                 }
             }
 
-            // ── Cut ───────────────────────────────────────────────────
             Key::KeyX => {
                 if mode_static {
-                    self.digit_held().map(HotkeyAction::StaticCut)
+                    self.last_digit.map(HotkeyAction::StaticCut)
                 } else {
                     Some(HotkeyAction::DynamicCut)
                 }
             }
 
-            // ── Paste ─────────────────────────────────────────────────
-            // Static: Cmd+Opt+V+[1-9] pastes from numbered slot
-            // Dynamic: Cmd+Opt+V pastes the current cursor entry
             Key::KeyV => {
                 if mode_static {
-                    self.digit_held().map(HotkeyAction::StaticPaste)
+                    self.last_digit.map(HotkeyAction::StaticPaste)
                 } else {
                     Some(HotkeyAction::DynamicPaste)
                 }
@@ -164,15 +192,13 @@ impl ChordDetector {
             _ => None,
         }
     }
+}
 
-    fn digit_held(&self) -> Option<usize> {
-        [
-            (Key::Num1, 1), (Key::Num2, 2), (Key::Num3, 3),
-            (Key::Num4, 4), (Key::Num5, 5), (Key::Num6, 6),
-            (Key::Num7, 7), (Key::Num8, 8), (Key::Num9, 9),
-        ]
-        .iter()
-        .find(|(k, _)| self.held.contains(k))
-        .map(|(_, d)| *d)
+fn key_to_digit(key: &Key) -> Option<usize> {
+    match key {
+        Key::Num1 => Some(1), Key::Num2 => Some(2), Key::Num3 => Some(3),
+        Key::Num4 => Some(4), Key::Num5 => Some(5), Key::Num6 => Some(6),
+        Key::Num7 => Some(7), Key::Num8 => Some(8), Key::Num9 => Some(9),
+        _ => None,
     }
 }

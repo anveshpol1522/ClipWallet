@@ -1,6 +1,6 @@
 //! macOS CGEventTap — intercepts and suppresses key events.
-//! Modifier keys arrive via FlagsChanged, NOT KeyDown/KeyUp.
-//! Injected Cmd+C/X events are identified and passed through cleanly.
+//! Uses detector's OWN modifier state on KeyUp (not live flags)
+//! to avoid timing bugs where Opt releases before C/X/V KeyUp fires.
 
 use crate::hotkey::{ChordDetector, HotkeyAction};
 use core_foundation::base::TCFType;
@@ -14,9 +14,7 @@ use std::sync::mpsc::SyncSender;
 use tracing::{debug, info};
 
 pub fn start_event_tap(tx: SyncSender<HotkeyAction>, mode_static: bool) {
-    let detector     = RefCell::new(ChordDetector::new());
-    // One-shot flag: ignore the next KeyC or KeyX that arrives
-    // after we inject simulate_copy / simulate_cut
+    let detector      = RefCell::new(ChordDetector::new());
     let ignore_next_c = RefCell::new(false);
     let ignore_next_x = RefCell::new(false);
 
@@ -71,7 +69,7 @@ fn handle_event(
 
     match event_type {
 
-        // ── FlagsChanged ──────────────────────────────────────────────
+        // ── FlagsChanged: modifier press / release ────────────────────
         CGEventType::FlagsChanged => {
             sync_modifiers(detector, flags);
             debug!("Modifiers → cmd={} opt={}", cmd, opt);
@@ -80,31 +78,27 @@ fn handle_event(
 
         // ── KeyDown ───────────────────────────────────────────────────
         CGEventType::KeyDown => {
+            // Filter autorepeat
             let is_repeat = event
                 .get_integer_value_field(EventField::KEYBOARD_EVENT_AUTOREPEAT)
                 == 1;
-
-            if is_repeat && cmd && opt {
+            if is_repeat && detector.cmd() && detector.opt() {
                 return None;
             }
 
             let keycode = event
                 .get_integer_value_field(EventField::KEYBOARD_EVENT_KEYCODE)
                 as u16;
-
             let key = match keycode_to_rdev(keycode) {
                 Some(k) => k,
                 None    => return Some(event.to_owned()),
             };
 
-            // ── Injection guard ───────────────────────────────────────
-            // If we injected Cmd+C or Cmd+X, the next KeyC / KeyX that
-            // arrives is our own injection — let it pass through and
-            // clear the flag so normal copies work afterward.
+            // Injection passthrough guard
             if key == rdev::Key::KeyC && *ignore_next_c {
                 *ignore_next_c = false;
                 debug!("Passing injected Cmd+C through");
-                return Some(event.to_owned()); // pass to target app
+                return Some(event.to_owned());
             }
             if key == rdev::Key::KeyX && *ignore_next_x {
                 *ignore_next_x = false;
@@ -112,44 +106,44 @@ fn handle_event(
                 return Some(event.to_owned());
             }
 
+            // Update detector held set FIRST so digit actions see C/X/V
             detector.key_down(key.clone());
             debug!("KeyDown {:?}  cmd={} opt={}", key, cmd, opt);
 
-            if cmd && opt {
-                // Set ignore flag BEFORE firing DynamicCopy/Cut
-                // so when simulate_copy/simulate_cut fires Cmd+C/X
-                // we pass it straight through
-                if key == rdev::Key::KeyC {
-                    *ignore_next_c = true;
-                }
-                if key == rdev::Key::KeyX {
-                    *ignore_next_x = true;
-                }
+            if detector.cmd() && detector.opt() {
+                // Set injection guard before firing so injected key passes through
+                if key == rdev::Key::KeyC { *ignore_next_c = true; }
+                if key == rdev::Key::KeyX { *ignore_next_x = true; }
 
                 if let Some(action) = detector.evaluate_press(&key, mode_static) {
                     debug!("Action (press): {:?}", action);
                     let _ = tx.send(action);
                 }
-                return None;
+                return None; // suppress
             }
 
             Some(event.to_owned())
         }
 
         // ── KeyUp ─────────────────────────────────────────────────────
+        // IMPORTANT: Use detector's OWN modifier state, not live flags.
+        // Live flags can already show Opt=false by the time C KeyUp fires.
+        // The detector tracks modifiers independently via FlagsChanged
+        // but we check clipwallet_active() BEFORE key_up() clears state.
         CGEventType::KeyUp => {
             let keycode = event
                 .get_integer_value_field(EventField::KEYBOARD_EVENT_KEYCODE)
                 as u16;
-
             let key = match keycode_to_rdev(keycode) {
                 Some(k) => k,
                 None    => return Some(event.to_owned()),
             };
 
-            let was_clipwallet = cmd && opt;
+            // Use detector state (not live flags) — timing-safe
+            let was_active = detector.cmd() && detector.opt();
+            debug!("KeyUp {:?}  detector_active={}", key, was_active);
 
-            if was_clipwallet {
+            if was_active {
                 if let Some(action) = detector.evaluate_release(&key, mode_static) {
                     debug!("Action (release): {:?}", action);
                     let _ = tx.send(action);
@@ -158,10 +152,7 @@ fn handle_event(
 
             detector.key_up(key);
 
-            if was_clipwallet {
-                return None;
-            }
-
+            if was_active { return None; }
             Some(event.to_owned())
         }
 
@@ -171,21 +162,18 @@ fn handle_event(
 
 fn sync_modifiers(detector: &mut ChordDetector, flags: CGEventFlags) {
     use rdev::Key;
-
     if flags.contains(CGEventFlags::CGEventFlagCommand) {
         detector.key_down(Key::MetaLeft);
     } else {
         detector.key_up(Key::MetaLeft);
         detector.key_up(Key::MetaRight);
     }
-
     if flags.contains(CGEventFlags::CGEventFlagAlternate) {
         detector.key_down(Key::Alt);
     } else {
         detector.key_up(Key::Alt);
         detector.key_up(Key::AltGr);
     }
-
     if flags.contains(CGEventFlags::CGEventFlagShift) {
         detector.key_down(Key::ShiftLeft);
     } else {
@@ -215,12 +203,8 @@ fn keycode_to_rdev(code: u16) -> Option<rdev::Key> {
         36  => Return,
         51  => Backspace,
         49  => Space,
-
-        123 => LeftArrow,
-        124 => RightArrow,
-        125 => DownArrow,
-        126 => UpArrow,
-
+        123 => LeftArrow, 124 => RightArrow,
+        125 => DownArrow,  126 => UpArrow,
         _ => return None,
     })
 }
