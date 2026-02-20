@@ -4,6 +4,7 @@ use crate::clipboard::types::{ClipData, ClipEntry};
 use crate::hotkey::{
     simulate_copy, simulate_cut, simulate_paste, simulate_paste_delayed, HotkeyAction,
 };
+use crate::notify;
 use crate::static_store::StaticSlotStore;
 use crate::storage::encrypted::{load_from_vault, save_to_vault};
 use crate::storage::ram::{next_id, RamStore};
@@ -17,7 +18,7 @@ const PASTE_SETTLE_MS: u64 = 60;
 pub struct Engine {
     ram:          Arc<RwLock<RamStore>>,
     clipboard:    Clipboard,
-    static_store: StaticSlotStore,  // dedicated fixed-array store, not shared
+    static_store: StaticSlotStore,
 }
 
 impl Engine {
@@ -82,7 +83,7 @@ impl Engine {
         None
     }
 
-    // ── Sync to system clipboard (no injection) ───────────────────────
+    // ── Sync to system clipboard ──────────────────────────────────────
 
     fn sync_to_system_clipboard(&mut self, data: &ClipData) -> bool {
         match data {
@@ -130,24 +131,50 @@ impl Engine {
         }
     }
 
-    // ── Debug: print full static slot table ───────────────────────────
+    // ── Short preview for notifications ───────────────────────────────
+
+    fn short_preview(data: &ClipData) -> String {
+        match data {
+            ClipData::PlainText(t) => {
+                let s: String = t.chars().take(40).collect();
+                let s = s.replace('\n', " ");
+                if t.len() > 40 { format!("{}…", s) } else { s }
+            }
+            ClipData::Image { width, height, .. } => format!("Image {}×{}", width, height),
+            ClipData::FilePath(p) => format!("{} file(s)", p.len()),
+            ClipData::RichText(b) => format!("RTF {} bytes", b.len()),
+            ClipData::Binary(b)   => format!("Binary {} bytes", b.len()),
+        }
+    }
+
+    // ── Debug logging ─────────────────────────────────────────────────
+
+    fn entry_preview(&self, entry: &ClipEntry) -> String {
+        match &entry.data {
+            ClipData::PlainText(t) => {
+                let s: String = t.chars().take(40).collect();
+                let s = s.replace('\n', "↵");
+                if t.len() > 40 { format!("\"{}…\"", s) } else { format!("\"{}\"", s) }
+            }
+            ClipData::Image { width, height, .. } => format!("[Image {}x{}]", width, height),
+            ClipData::FilePath(p)  => format!("[{} file(s)]", p.len()),
+            ClipData::RichText(b)  => format!("[RTF {} bytes]", b.len()),
+            ClipData::Binary(b)    => format!("[Binary {} bytes]", b.len()),
+        }
+    }
 
     fn log_static_state(&self) {
-        debug!("┌─ Static Slots ({}/{} occupied) ────────────────────────",
+        debug!("┌─ Static Slots ({}/{} occupied) ──────────────────────",
             self.static_store.occupied_count(), 9);
         for i in 0..9 {
-            let slot   = i + 1;
             let marker = if i == self.static_store.cursor { "►" } else { " " };
             match &self.static_store.slots[i] {
-                Some(e) => {
-                    let preview = self.entry_preview(e);
-                    debug!("│ {} slot {} → id={} type={} | {}",
-                        marker, slot, e.id, e.data.type_label(), preview);
-                }
-                None => debug!("│ {} slot {} → NULL", marker, slot),
+                Some(e) => debug!("│ {} slot {} → id={} type={} | {}",
+                    marker, i+1, e.id, e.data.type_label(), self.entry_preview(e)),
+                None    => debug!("│ {} slot {} → NULL", marker, i+1),
             }
         }
-        debug!("└─────────────────────────────────────────────────────────");
+        debug!("└──────────────────────────────────────────────────────");
     }
 
     fn log_ring_state(&self) {
@@ -158,116 +185,84 @@ impl Engine {
         for (i, entry) in ram.dynamic_ring.iter().enumerate() {
             let marker = if i == cur { "►" } else { " " };
             debug!("│ {} [{}] id={} type={} | {}",
-                marker, i, entry.id, entry.data.type_label(),
-                self.entry_preview(entry));
+                marker, i, entry.id, entry.data.type_label(), self.entry_preview(entry));
         }
         if len == 0 { debug!("│   (empty)"); }
         debug!("└─ Cursor [{}] — live in Cmd+V ──────────────────────", cur);
     }
 
-    fn entry_preview(&self, entry: &ClipEntry) -> String {
-        match &entry.data {
-            ClipData::PlainText(t) => {
-                let s: String = t.chars().take(40).collect();
-                let s = s.replace('\n', "↵");
-                if t.len() > 40 { format!("\"{}…\"", s) }
-                else            { format!("\"{}\"", s) }
-            }
-            ClipData::Image { width, height, .. } => format!("[Image {}x{}]", width, height),
-            ClipData::FilePath(p)  => format!("[{} file(s)]", p.len()),
-            ClipData::RichText(b)  => format!("[RTF {} bytes]", b.len()),
-            ClipData::Binary(b)    => format!("[Binary {} bytes]", b.len()),
-        }
-    }
-
     // ════════════════════════════════════════════════════════════════
-    // STATIC MODE — Fixed addressed slots
-    //
-    // Slot 1-9 are permanent array positions.
-    // Writing to slot N always goes to index N-1, nowhere else.
-    // Tab cursor only moves the read pointer — never reorders data.
+    // STATIC MODE
     // ════════════════════════════════════════════════════════════════
 
-    /// Cmd+Opt+C+N:
-    /// Inject Cmd+C → read clipboard → write to slot N → log full table.
     fn static_copy(&mut self, slot: usize) {
         info!("[Static][COPY] slot={} — injecting Cmd+C", slot);
         simulate_copy();
-
         if let Some(data) = self.read_clipboard() {
-            let entry = ClipEntry::new(next_id(), data);
-            info!("[Static][COPY] slot={} ← id={} type={} size={}B",
-                slot, entry.id, entry.data.type_label(), entry.data.size_bytes());
+            let preview = Self::short_preview(&data);
+            let entry   = ClipEntry::new(next_id(), data);
+            info!("[Static][COPY] slot={} ← id={} type={}", slot, entry.id, entry.data.type_label());
             self.static_store.write(slot, entry);
             self.log_static_state();
+            notify::notify_static_copy(slot, &preview);
         }
     }
 
-    /// Cmd+Opt+X+N:
-    /// Inject Cmd+X → read clipboard → write to slot N.
     fn static_cut(&mut self, slot: usize) {
         info!("[Static][CUT] slot={} — injecting Cmd+X", slot);
         simulate_cut();
-
         if let Some(data) = self.read_clipboard() {
-            let entry = ClipEntry::new(next_id(), data);
-            info!("[Static][CUT] slot={} ← id={} type={}",
-                slot, entry.id, entry.data.type_label());
+            let preview = Self::short_preview(&data);
+            let entry   = ClipEntry::new(next_id(), data);
+            info!("[Static][CUT] slot={} ← id={} type={}", slot, entry.id, entry.data.type_label());
             self.static_store.write(slot, entry);
             self.log_static_state();
+            notify::notify_static_cut(slot, &preview);
         }
     }
 
-    /// Cmd+Opt+V+N:
-    /// Sync slot N to clipboard → schedule Cmd+V injection after 300ms.
-    /// The 300ms delay ensures Opt is released before injection
-    /// so our CGEventTap doesn't suppress the injected Cmd+V.
     fn static_paste(&mut self, slot: usize) {
         let data = self.static_store.read(slot).map(|e| e.data.clone());
         match data {
             Some(d) => {
-                info!("[Static][PASTE] slot={} — syncing + scheduling Cmd+V", slot);
+                info!("[Static][PASTE] slot={} — syncing + scheduling", slot);
                 self.sync_to_system_clipboard(&d);
                 simulate_paste_delayed();
+                notify::notify_static_paste(slot);
             }
-            None => warn!("[Static][PASTE] slot={} is NULL — nothing to paste", slot),
+            None => warn!("[Static][PASTE] slot={} is NULL", slot),
         }
     }
 
-    /// Cmd+Opt+Tab / Shift+Tab:
-    /// Move cursor to next/prev occupied slot.
-    /// Sync that slot's content to system clipboard → Cmd+V pastes it.
     fn static_nav(&mut self, direction: i32) {
         let result = if direction > 0 {
             self.static_store.cursor_next()
         } else {
             self.static_store.cursor_prev()
         };
-
         match result {
             Some(slot) => {
                 let data = self.static_store.cursor_entry()
                     .map(|e| (e.id, e.data.type_label(), e.data.clone()));
-
                 if let Some((id, type_label, d)) = data {
-                    info!("[Static][NAV] Cursor → slot {} id={} type={} — live in Cmd+V",
-                        slot, id, type_label);
+                    let preview = Self::short_preview(&d);
+                    info!("[Static][NAV] → slot {} id={} type={}", slot, id, type_label);
                     self.sync_to_system_clipboard(&d);
                     self.log_static_state();
+                    notify::notify_static_nav(slot, &preview);
                 }
             }
-            None => warn!("[Static][NAV] All slots are NULL — nothing to navigate"),
+            None => warn!("[Static][NAV] All slots NULL"),
         }
     }
 
-    /// Cmd+Opt+Tab+Esc:
-    /// Set slot at current cursor to NULL.
     fn static_delete(&mut self) {
-        let slot = self.static_store.cursor_slot();
+        let slot     = self.static_store.cursor_slot();
         let was_some = self.static_store.cursor_entry().is_some();
         if was_some {
             self.static_store.delete_at_cursor();
             info!("[Static][DELETE] slot={} → NULL", slot);
+            notify::notify_static_delete(slot);
         } else {
             warn!("[Static][DELETE] slot={} already NULL", slot);
         }
@@ -275,20 +270,26 @@ impl Engine {
     }
 
     // ════════════════════════════════════════════════════════════════
-    // DYNAMIC MODE — Recency ring
+    // DYNAMIC MODE
     // ════════════════════════════════════════════════════════════════
 
     fn dynamic_copy(&mut self) {
         info!("[Dynamic][COPY] Injecting Cmd+C...");
         simulate_copy();
         if let Some(data) = self.read_clipboard() {
-            let entry = ClipEntry::new(next_id(), data);
+            let preview = Self::short_preview(&data);
+            let entry   = ClipEntry::new(next_id(), data);
             info!("[Dynamic][COPY] id={} type={} size={}B → ring[0]",
                 entry.id, entry.data.type_label(), entry.data.size_bytes());
             let evicted = self.ram.write().unwrap().push_dynamic(entry.clone());
             if let Some(old) = evicted { info!("[Dynamic][EVICT] Dropped: {}", old); }
             self.sync_to_system_clipboard(&entry.data);
+            let (pos, total) = {
+                let ram = self.ram.read().unwrap();
+                (ram.dynamic_cursor + 1, ram.ring_len())
+            };
             self.log_ring_state();
+            notify::notify_dynamic_copy(pos, total, &preview);
         }
     }
 
@@ -296,26 +297,31 @@ impl Engine {
         info!("[Dynamic][CUT] Injecting Cmd+X...");
         simulate_cut();
         if let Some(data) = self.read_clipboard() {
-            let entry = ClipEntry::new(next_id(), data);
-            info!("[Dynamic][CUT] id={} type={} → ring[0]",
-                entry.id, entry.data.type_label());
+            let preview = Self::short_preview(&data);
+            let entry   = ClipEntry::new(next_id(), data);
+            info!("[Dynamic][CUT] id={} type={} → ring[0]", entry.id, entry.data.type_label());
             self.ram.write().unwrap().push_dynamic(entry.clone());
             self.sync_to_system_clipboard(&entry.data);
+            let (pos, total) = {
+                let ram = self.ram.read().unwrap();
+                (ram.dynamic_cursor + 1, ram.ring_len())
+            };
             self.log_ring_state();
+            notify::notify_dynamic_cut(pos, total, &preview);
         }
     }
 
     fn dynamic_paste(&mut self) {
         let data = {
             let ram = self.ram.read().unwrap();
-            ram.current_dynamic().map(|e| (e.id, e.data.clone()))
+            ram.current_dynamic().map(|e| (e.id, e.data.clone(), ram.dynamic_cursor, ram.ring_len()))
         };
         match data {
-            Some((id, d)) => {
-                let cursor = self.ram.read().unwrap().dynamic_cursor;
+            Some((id, d, cursor, total)) => {
                 info!("[Dynamic][PASTE] ring[{}] id={} — syncing + scheduling", cursor, id);
                 self.sync_to_system_clipboard(&d);
                 simulate_paste_delayed();
+                notify::notify_dynamic_paste(cursor + 1, total);
             }
             None => warn!("[Dynamic][PASTE] Ring is empty"),
         }
@@ -328,13 +334,16 @@ impl Engine {
         }
         let data = {
             let ram = self.ram.read().unwrap();
-            ram.current_dynamic().map(|e| (e.id, e.data.type_label(), ram.dynamic_cursor, ram.ring_len(), e.data.clone()))
+            ram.current_dynamic().map(|e| {
+                (e.id, e.data.type_label(), ram.dynamic_cursor, ram.ring_len(), e.data.clone())
+            })
         };
         if let Some((id, type_label, cursor, total, d)) = data {
-            info!("[Dynamic][NAV] [{}/{}] id={} type={} — synced to Cmd+V",
-                cursor + 1, total, id, type_label);
+            let preview = Self::short_preview(&d);
+            info!("[Dynamic][NAV] [{}/{}] id={} type={}", cursor+1, total, id, type_label);
             self.sync_to_system_clipboard(&d);
             self.log_ring_state();
+            notify::notify_dynamic_nav(cursor + 1, total, &preview);
         }
     }
 
@@ -346,6 +355,7 @@ impl Engine {
         let next = self.ram.read().unwrap().current_dynamic().map(|e| e.data.clone());
         if let Some(d) = next { self.sync_to_system_clipboard(&d); }
         self.log_ring_state();
+        notify::notify_dynamic_delete(cursor);
     }
 
     fn cursor_reset(&mut self) {

@@ -3,6 +3,7 @@ mod config;
 mod daemon;
 mod engine;
 mod hotkey;
+mod notify;
 mod static_store;
 mod storage;
 
@@ -31,9 +32,10 @@ MODES:
   Static  — 9 named slots (Cmd+Opt+C/V/X + digit 1-9)
   Dynamic — Recency-ordered ring of up to 50 entries
 
-Run 'clipwallet run' to start the background service.
-Run 'clipwallet install' to register it as a login daemon.
-Run 'clipwallet mode static' or 'clipwallet mode dynamic' to switch modes.
+Encryption and memory are always ON by default.
+  clipwallet remove encryption   — wipes vault + Keychain key
+  clipwallet clear memory        — erases all clipboard history from disk
+  clipwallet change mode         — interactively switch Static ↔ Dynamic
 "
 )]
 struct Cli {
@@ -46,7 +48,7 @@ enum Commands {
     /// Start the ClipWallet background service (foreground)
     Run,
 
-    /// Install ClipWallet as a launchd login agent
+    /// Install ClipWallet as a launchd login agent (auto-starts on login)
     Install,
 
     /// Uninstall the launchd agent
@@ -59,10 +61,25 @@ enum Commands {
     /// Show daemon and storage status
     Status,
 
-    /// Set clipboard mode: static or dynamic
-    Mode {
-        #[arg(value_enum)]
-        mode: CliMode,
+    /// Interactively switch between Static and Dynamic mode
+    #[command(name = "change")]
+    Change {
+        #[command(subcommand)]
+        what: ChangeTarget,
+    },
+
+    /// Remove vault encryption and wipe the Keychain key
+    #[command(name = "remove")]
+    Remove {
+        #[command(subcommand)]
+        target: RemoveTarget,
+    },
+
+    /// Clear all clipboard history from disk and RAM
+    #[command(name = "clear")]
+    Clear {
+        #[command(subcommand)]
+        target: ClearTarget,
     },
 
     /// List all encrypted vault entries
@@ -78,10 +95,22 @@ enum Commands {
     VaultRotate,
 }
 
-#[derive(Debug, Clone, clap::ValueEnum)]
-enum CliMode {
-    Static,
-    Dynamic,
+#[derive(Subcommand)]
+enum ChangeTarget {
+    /// Switch between Static and Dynamic mode
+    Mode,
+}
+
+#[derive(Subcommand)]
+enum RemoveTarget {
+    /// Remove vault encryption and wipe the Keychain key
+    Encryption,
+}
+
+#[derive(Subcommand)]
+enum ClearTarget {
+    /// Erase all clipboard history (dynamic ring + static slots) from disk
+    Memory,
 }
 
 // ── Entry Point ───────────────────────────────────────────────────────────────
@@ -98,14 +127,14 @@ async fn main() -> anyhow::Result<()> {
     match cli.command {
         Commands::Run => run_service().await?,
 
-        Commands::Install => daemon::plist::install()?,
-
-        Commands::Mode { mode } => {
-            let m = match mode {
-                CliMode::Static  => ClipMode::Static,
-                CliMode::Dynamic => ClipMode::Dynamic,
-            };
-            set_mode(m)?;
+        // ── Install / Uninstall ───────────────────────────────────────────────
+        Commands::Install => {
+            daemon::plist::install()?;
+            println!("ClipWallet installed ✓ — will auto-start on every login.");
+            println!("Encryption and memory are ON by default.");
+            println!("To switch mode:        clipwallet change mode");
+            println!("To remove encryption:  clipwallet remove encryption");
+            println!("To clear history:      clipwallet clear memory");
         }
 
         Commands::Uninstall { purge } => {
@@ -116,12 +145,14 @@ async fn main() -> anyhow::Result<()> {
                 daemon::status::wipe_all_data()?;
                 println!("ClipWallet fully purged ✓");
             } else {
-                println!("Remove encryption key from Keychain? [y/N]");
+                println!("Also remove encryption key from Keychain? [y/N]");
                 let mut input = String::new();
                 std::io::stdin().read_line(&mut input)?;
                 if input.trim().eq_ignore_ascii_case("y") {
                     if let Err(e) = storage::delete_key() {
                         eprintln!("Warning: Could not remove key: {}", e);
+                    } else {
+                        println!("Keychain key removed ✓");
                     }
                 }
 
@@ -130,26 +161,119 @@ async fn main() -> anyhow::Result<()> {
                 std::io::stdin().read_line(&mut input2)?;
                 if input2.trim().eq_ignore_ascii_case("y") {
                     daemon::status::wipe_all_data()?;
+                    println!("Clipboard data wiped ✓");
                 }
             }
         }
 
+        // ── change mode ───────────────────────────────────────────────────────
+        Commands::Change { what: ChangeTarget::Mode } => {
+            let current = config::load().mode;
+            println!("Current mode: {}", current);
+            println!();
+            println!("Choose new mode:");
+            println!("  1 — Static  (Cmd+Opt+C/V/X + digit 1-9, 9 named slots)");
+            println!("  2 — Dynamic (Cmd+Opt+C, Tab to navigate ring)");
+            println!();
+            print!("Enter 1 or 2: ");
+
+            use std::io::Write;
+            std::io::stdout().flush()?;
+
+            let mut input = String::new();
+            std::io::stdin().read_line(&mut input)?;
+
+            let new_mode = match input.trim() {
+                "1" => ClipMode::Static,
+                "2" => ClipMode::Dynamic,
+                _ => {
+                    println!("Invalid choice — mode unchanged.");
+                    return Ok(());
+                }
+            };
+
+            if new_mode == current {
+                println!("Already in {} mode — no change needed.", current);
+                return Ok(());
+            }
+
+            set_mode(new_mode.clone())?;
+            notify::notify_mode_changed(&new_mode.to_string());
+            println!();
+            println!("Mode changed to: {} ✓", new_mode);
+            println!("Restart the daemon to apply:");
+            println!("  clipwallet uninstall && clipwallet install");
+        }
+
+        // ── remove encryption ─────────────────────────────────────────────────
+        Commands::Remove { target: RemoveTarget::Encryption } => {
+            println!("This will permanently delete the encryption key from Keychain");
+            println!("and erase all vault-encrypted entries. Continue? [y/N]");
+
+            let mut input = String::new();
+            std::io::stdin().read_line(&mut input)?;
+
+            if !input.trim().eq_ignore_ascii_case("y") {
+                println!("Aborted — encryption unchanged.");
+                return Ok(());
+            }
+
+            // Wipe vault files
+            let vault_dir = storage::encrypted::vault_dir();
+            if vault_dir.exists() {
+                std::fs::remove_dir_all(&vault_dir)?;
+                println!("Vault entries deleted ✓");
+            } else {
+                println!("No vault entries found.");
+            }
+
+            // Remove Keychain key
+            match storage::delete_key() {
+                Ok(_)  => println!("Keychain key removed ✓"),
+                Err(e) => println!("Keychain key not found ({})", e),
+            }
+
+            notify::notify_encryption_removed();
+            println!("Encryption removed. New data will still be stored (unencrypted vault).");
+            println!("To re-enable: restart the daemon — it will generate a new key automatically.");
+        }
+
+        // ── clear memory ──────────────────────────────────────────────────────
+        Commands::Clear { target: ClearTarget::Memory } => {
+            println!("This will erase ALL clipboard history (dynamic ring + static slots).");
+            println!("Vault-encrypted entries are NOT affected. Continue? [y/N]");
+
+            let mut input = String::new();
+            std::io::stdin().read_line(&mut input)?;
+
+            if !input.trim().eq_ignore_ascii_case("y") {
+                println!("Aborted — memory unchanged.");
+                return Ok(());
+            }
+
+            daemon::status::wipe_all_data()?;
+            notify::notify_memory_cleared();
+            println!("Memory cleared ✓ — clipboard history erased from disk.");
+            println!("Restart the daemon to clear RAM too:");
+            println!("  clipwallet uninstall && clipwallet install");
+        }
+
+        // ── Status ────────────────────────────────────────────────────────────
         Commands::Status => {
             daemon::plist::status();
             daemon::status::print_full_status();
         }
 
+        // ── Vault ─────────────────────────────────────────────────────────────
         Commands::VaultList => {
             let ids = storage::list_vault_ids();
             if ids.is_empty() {
                 println!("Vault is empty.");
             } else {
-                println!("── Vault Entries ────────────────────────────────");
-                for id in &ids {
-                    println!("  id = {}", id);
-                }
+                println!("── Vault Entries ────────────────────────────────────");
+                for id in &ids { println!("  id = {}", id); }
                 println!("  Total: {}", ids.len());
-                println!("─────────────────────────────────────────────────");
+                println!("─────────────────────────────────────────────────────");
             }
         }
 
@@ -167,7 +291,7 @@ async fn main() -> anyhow::Result<()> {
 // ── Service Loop ──────────────────────────────────────────────────────────────
 
 async fn run_service() -> anyhow::Result<()> {
-    // ── Load mode from persistent config ─────────────────────────────
+    // ── Load mode from persistent config ─────────────────────────────────────
     let cfg         = config::load();
     let mode_static = cfg.mode == ClipMode::Static;
     info!(
@@ -175,7 +299,16 @@ async fn run_service() -> anyhow::Result<()> {
         if mode_static { "STATIC" } else { "DYNAMIC" }
     );
 
-    // ── Shared RAM store ──────────────────────────────────────────────
+    // ── Encryption + memory ON by default ────────────────────────────────────
+    // The vault key is created automatically if it doesn't exist.
+    // No user action required — it just works.
+    if let Err(e) = storage::encrypted::get_or_create_key() {
+        error!("Failed to initialise encryption key: {}", e);
+    } else {
+        info!("Encryption key ready ✓");
+    }
+
+    // ── Shared RAM store ──────────────────────────────────────────────────────
     let ram = Arc::new(RwLock::new(RamStore::new()));
     {
         let mut w = ram.write().unwrap();
@@ -186,42 +319,31 @@ async fn run_service() -> anyhow::Result<()> {
     }
     info!("Disk state loaded into RAM ✓");
 
-    // ── Shared tokio channel — all tasks send actions here ────────────
+    // ── Shared tokio channel ──────────────────────────────────────────────────
     let (tx, mut rx) = mpsc::unbounded_channel::<HotkeyAction>();
 
-    // ── Task 1: CGEventTap key grabber ────────────────────────────────
-    // CGEventTap intercepts keys at the macOS HID layer and can suppress
-    // them (return None) before they reach any other application.
-    // It must run on its own OS thread with its own CFRunLoop — it cannot
-    // live inside tokio's async runtime.
-    //
-    // We bridge std::sync::mpsc → tokio::mpsc via a lightweight relay task.
-
+    // ── Task 1: CGEventTap key grabber ────────────────────────────────────────
     let (tap_tx, tap_rx) = std::sync::mpsc::sync_channel::<HotkeyAction>(64);
-
-    // Relay task: forwards actions from the CGEventTap thread into tokio
     let tx_bridge = tx.clone();
     tokio::task::spawn_blocking(move || {
         while let Ok(action) = tap_rx.recv() {
             let _ = tx_bridge.send(action);
         }
     });
-
-    // CGEventTap thread — blocks forever running CFRunLoop
     std::thread::spawn(move || {
         hotkey::grabber::start_event_tap(tap_tx, mode_static);
     });
 
-    // ── Task 2: Engine event loop ─────────────────────────────────────
-    let ram_engine  = Arc::clone(&ram);
-    let mut engine  = Engine::new(ram_engine)?;
+    // ── Task 2: Engine event loop ─────────────────────────────────────────────
+    let ram_engine = Arc::clone(&ram);
+    let mut engine = Engine::new(ram_engine)?;
     let engine_handle = tokio::spawn(async move {
         while let Some(action) = rx.recv().await {
             engine.handle(action);
         }
     });
 
-    // ── Task 3: Periodic flush (every 60 seconds) ─────────────────────
+    // ── Task 3: Periodic flush (every 60 seconds) ─────────────────────────────
     let ram_flush = Arc::clone(&ram);
     let flush_handle = tokio::spawn(async move {
         let mut ticker = interval(Duration::from_secs(60));
@@ -234,7 +356,7 @@ async fn run_service() -> anyhow::Result<()> {
         }
     });
 
-    // ── Task 4: Signal handler (SIGTERM / Ctrl+C → clean shutdown) ────
+    // ── Task 4: Signal handler (Ctrl+C / SIGTERM → clean shutdown) ────────────
     let ram_signal = Arc::clone(&ram);
     ctrlc::set_handler(move || {
         info!("Shutdown signal — flushing to disk...");
@@ -245,9 +367,7 @@ async fn run_service() -> anyhow::Result<()> {
     })
     .expect("Cannot set signal handler");
 
-    // ── Task 5: Cursor timeout watchdog ──────────────────────────────
-    // Fires CursorReset if the dynamic ring cursor hasn't moved in
-    // CURSOR_TIMEOUT_SECS seconds, snapping it back to the most recent entry.
+    // ── Task 5: Cursor timeout watchdog ───────────────────────────────────────
     let ram_cursor = Arc::clone(&ram);
     let tx_cursor  = tx.clone();
     let cursor_handle = tokio::spawn(async move {
@@ -264,9 +384,7 @@ async fn run_service() -> anyhow::Result<()> {
         "ClipWallet running ✓  |  Mode: {}  |  Listening for hotkeys...",
         if mode_static { "STATIC" } else { "DYNAMIC" }
     );
-    info!(
-        "Tip: System Settings → Privacy & Security → Accessibility → add clipwallet"
-    );
+    info!("Tip: System Settings → Privacy & Security → Accessibility → add clipwallet");
 
     let _ = tokio::join!(engine_handle, flush_handle, cursor_handle);
     Ok(())
@@ -280,7 +398,6 @@ fn rotate_vault_key() -> anyhow::Result<()> {
     };
 
     println!("Rotating encryption key...");
-
     let dir = vault_dir();
     if !dir.exists() {
         println!("No vault entries found — nothing to rotate.");
@@ -289,7 +406,6 @@ fn rotate_vault_key() -> anyhow::Result<()> {
 
     let ids = storage::list_vault_ids();
     let mut entries = Vec::new();
-
     for id in &ids {
         let path  = dir.join(format!("{}.vlt", id));
         let bytes = std::fs::read(&path)?;
@@ -299,14 +415,9 @@ fn rotate_vault_key() -> anyhow::Result<()> {
         }
     }
 
-    // Delete old key → get_or_create_key generates and stores a fresh one
     delete_key()?;
     get_or_create_key()?;
-
-    for entry in &entries {
-        save_to_vault(entry)?;
-    }
-
+    for entry in &entries { save_to_vault(entry)?; }
     println!("Key rotated — {} entries re-encrypted ✓", entries.len());
     Ok(())
 }
