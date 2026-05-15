@@ -1,0 +1,71 @@
+[package]
+name        = "clipwallet"
+version     = "0.1.0"
+edition     = "2021"
+description = "A persistent, encrypted clipboard manager for macOS"
+authors     = ["Shaarav Raghu <shaaravraghu@gmail.com>"]
+license     = "MIT"
+repository  = "https://github.com/shaaravraghu/ClipWallet"
+homepage    = "https://github.com/shaaravraghu/ClipWallet"
+keywords    = ["clipboard", "macos", "hotkey", "productivity"]
+categories  = ["command-line-utilities"]
+
+[[bin]]
+name = "clipwallet"
+path = "src/main.rs"
+
+[dependencies]
+# Global hotkey interception
+rdev          = "0.5"
+core-graphics = "0.23"
+core-foundation = "0.9"
+
+# macOS clipboard read/write
+arboard = "3"
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# Serialization for disk persistence
+serde     = { version = "1", features = ["derive"] }
+rmp-serde = "1"
+
+# Encryption
+aes-gcm = "0.10"
+rand    = "0.8"
+
+# macOS Keychain
+keyring = "2"
+
+# Signal handling
+ctrlc = { version = "3", features = ["termination"] }
+
+# CLI argument parsing
+clap = { version = "4", features = ["derive"] }
+
+# Logging
+tracing            = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Path helpers
+dirs = "5"
+
+# Timestamps
+chrono = { version = "0.4", features = ["serde"] }
+
+# Error handling
+anyhow = "1"
+hex    = "0.4"
+
+# Phase 5 — rich data types
+infer  = "0.15"
+objc   = "0.2"
+image  = { version = "0.24", default-features = false, features = ["png", "jpeg"] }
+toml = "1.0.3"
+
+[profile.release]
+opt-level     = 3
+strip         = true
+lto           = true
+codegen-units = 1
+
