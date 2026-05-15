@@ -16,7 +16,7 @@
     <img src="https://img.shields.io/badge/platform-macOS-blue?style=flat-square&logo=apple" alt="macOS">
     <img src="https://img.shields.io/badge/license-MIT-green?style=flat-square" alt="License">
     <img src="https://img.shields.io/badge/version-0.1.0-purple?style=flat-square" alt="Version">
-    <img src="https://img.shields.io/badge/GSSoC'25-Contributor%20Friendly-yellow?style=flat-square" alt="GSSoC">
+    <img src="https://img.shields.io/badge/GSSoC'26-Contributor%20Friendly-yellow?style=flat-square" alt="GSSoC">
   </p>
 </p>
 
@@ -29,6 +29,12 @@ You use `Ctrl+C` / `Cmd+C` a million times a day. Every single time, your previo
 ## The Solution
 
 **ClipWallet** turns your clipboard into a **wallet** — multiple addressable memory slots that persist across reboots, survive crashes, and encrypt sensitive data automatically. No GUI, no menubar clutter. Pure keyboard-native power.
+
+## Product Demo
+https://www.youtube.com/watch?v=WVQdXm9cpf4
+
+## Community
+https://discord.gg/X8Hr8P9J
 
 ---
 
