@@ -79,7 +79,7 @@ clipwallet status
 
 **Test it:** Select some text, press `Cmd+Opt+C+1`, then paste anywhere with `Cmd+Opt+V+1` ✓
 
-### Installation
+### Installation (VERY IMPORTANT)!
 
 *(Keep whatever Quick Install command is already here)*
 
