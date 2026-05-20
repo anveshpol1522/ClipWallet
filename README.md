@@ -92,13 +92,8 @@ Having trouble or prefer to build it yourself? Check out our [Beginner-Friendly 
 
 <details>
 <summary><b>👨‍💻 Developer: API Testing</b></summary>
-## Usage Examples
 
-### Real-World Workflows
-
-<details>
-<summary><b>👨‍💻 Developer: API Testing</b></summary>
-
+**Scenario:** Testing an API endpoint with multiple parameters
 **Scenario:** Testing an API endpoint with multiple parameters
 
 ```bash
