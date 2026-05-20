@@ -80,10 +80,11 @@ clipwallet status
 **Test it:** Select some text, press `Cmd+Opt+C+1`, then paste anywhere with `Cmd+Opt+V+1` ✓
 
 ---
-
 ## Installation
 
-Having trouble or prefer to build it yourself? Check out our [Beginner-Friendly Manual Installation Guide](MANUAL_INSTRUCTIONS.md) for step-by-step instructions for macOS.
+Having trouble or prefer to build it yourself? Check out our [Beginner-Friendly Manual Installation Guide](MANUAL_INSTRUCTIONS.md) for step-by-step instructions for Windows, macOS, and Linux.
+
+---
 
 ## Usage Examples
 
