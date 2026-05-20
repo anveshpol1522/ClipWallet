@@ -33,10 +33,9 @@ This project is part of **GirlScript Summer of Code (GSSoC) 2025**. We appreciat
   - Date:       Date of contribution
 -->
 
-| # | Name | GitHub | Issue | PR | Review | Type | Summary | Date |
-|---|------|--------|-------|----|------|------|---------|------|
-| 1 |      |        |       |    |      |      |         |      |
-
+| # | Name                 | GitHub        | Issue| PR| Review        | Type | Summary                                       | Date       |
+|---|----------------------|---------------|------|---|---------------|------|-----------------------------------------------|------------|
+| 1 | Anvesh (XploitGhost) | anveshpol1522 | #13  |#16| @shaaravraghu | Docs | Added comprehensive manual installation guide | 2026-05-20 |
 ---
 
 ## Contribution Type Legend 
