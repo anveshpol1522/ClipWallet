@@ -36,7 +36,7 @@ This project is part of **GirlScript Summer of Code (GSSoC) 2025**. We appreciat
 | # | Name | GitHub | Issue | PR | Review | Type | Summary | Date |
 |---|------|--------|-------|----|------|------|---------|------|
 | 1 | Rahul Singh | [@rahulsingh289](https://github.com/rahulsingh289) | - | #1, #2 | - | 📖 🔧 | Improved README with beginner-friendly documentation, added .gitignore for build artifacts | May 2026 |
-| 2 | Anvesh (XploitGhost) | [@anveshpol1522](https://github.com/anveshpol1522) | #13 | #16 | @shaaravraghu | 📖 | Added comprehensive manual installation guide for macOS | May 2026 |
+
 ---
 
 ## Contribution Type Legend 
